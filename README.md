@@ -55,8 +55,12 @@ curl -X POST "$BASE_URL/api/admin/users" -H "Authorization: Bearer $ADMIN_TOKEN"
 # Grant it only the knowledge bases this server should expose:
 curl -X POST "$BASE_URL/api/admin/knowledge-bases/<kbId>/memberships" \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"userId":"<new user id>"}'
+  -d '{"principalType":"USER","principalId":"<new user id>","permission":"READ"}'
 ```
+
+Verified against a live backend on 2026-10-15 (see the commit history / session notes) — this exact pair of
+calls, followed by a real `search_knowledge` and `list_documents` call through this server, returned real
+ACL-scoped results.
 
 ### 2. Configure this server
 
