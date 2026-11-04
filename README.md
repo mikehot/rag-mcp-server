@@ -146,3 +146,7 @@ and asserts no token, response body or user name appears.
 
 v0.2, per-caller token passthrough over stdio (default) or streamable-HTTP, shared service account only as an
 explicit opt-in, read-only. See [SECURITY.md](SECURITY.md) for what's out of scope and why.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
