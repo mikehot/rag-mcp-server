@@ -118,3 +118,7 @@ tool schemas and error mapping directly via `MCPServer.list_tools()` / `MCPServe
 
 v0.1, stdio transport only, single service-account auth, read-only. See
 [SECURITY.md](SECURITY.md) for exactly what's out of scope and why.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
