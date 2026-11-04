@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import asyncio
+import json
+
 import httpx
 import pytest
 
@@ -9,217 +12,187 @@ from rag_mcp_server.backend_client import (
     BackendProtocolError,
     BackendUnavailableError,
 )
+from rag_mcp_server.config import Settings
 
-LOGIN_URL = "http://backend.test/api/auth/login"
-EXECUTE_URL = "http://backend.test/api/agent/tools/execute"
-
-
-def _login_response(token: str = "jwt-1", expires_in: float = 86400) -> httpx.Response:
-    return httpx.Response(
-        200, json={"code": 0, "message": "ok", "data": {"token": token, "expiresIn": expires_in}}
-    )
+from .conftest import TOKEN_A, TOKEN_B, execute_ok
 
 
-def _execute_response(
-    name: str, success: bool = True, data: dict | None = None, failure_reason: str | None = None
-) -> httpx.Response:
-    return httpx.Response(
-        200,
-        json={
-            "code": 0,
-            "message": "ok",
-            "data": {
-                "requestId": "11111111-1111-1111-1111-111111111111",
-                "results": [
-                    {
-                        "name": name,
-                        "success": success,
-                        "data": data,
-                        "failureReason": failure_reason,
-                    }
-                ],
-            },
-        },
-    )
+async def _call(client: BackendClient, token: str | None = TOKEN_A, **kw):
+    try:
+        return await client.call_tool(
+            "search_knowledge", kw.get("args", {"query": "x"}), token=token
+        )
+    finally:
+        await client.aclose()
 
 
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_logs_in_once_and_reuses_token(settings, respx_mock):
-    login = respx_mock.post("/api/auth/login").mock(return_value=_login_response())
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_forwards_exactly_the_callers_token(settings, respx_mock):
     execute = respx_mock.post("/api/agent/tools/execute").mock(
-        return_value=_execute_response("search_knowledge", data={"found": True, "sources": []})
+        return_value=execute_ok("search_knowledge", {"found": True})
+    )
+    result = await _call(BackendClient(settings))
+    assert result.success is True and result.data == {"found": True}
+    assert execute.calls[0].request.headers["authorization"] == f"Bearer {TOKEN_A}"
+
+
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_two_callers_on_one_client_never_cross(settings, respx_mock):
+    execute = respx_mock.post("/api/agent/tools/execute").mock(
+        return_value=execute_ok("search_knowledge")
     )
     client = BackendClient(settings)
     try:
-        await client.call_tool("search_knowledge", {"query": "x"})
-        await client.call_tool("search_knowledge", {"query": "y"})
-    finally:
-        await client.aclose()
-    assert login.call_count == 1
-    assert execute.call_count == 2
-    assert execute.calls[0].request.headers["authorization"] == "Bearer jwt-1"
-
-
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_parses_a_successful_result(settings, respx_mock):
-    respx_mock.post("/api/auth/login").mock(return_value=_login_response())
-    respx_mock.post("/api/agent/tools/execute").mock(
-        return_value=_execute_response("list_documents", data={"items": []})
-    )
-    client = BackendClient(settings)
-    try:
-        result = await client.call_tool("list_documents", {})
-    finally:
-        await client.aclose()
-    assert result.success is True
-    assert result.data == {"items": []}
-    assert result.failure_reason is None
-
-
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_parses_a_failed_result_without_raising(settings, respx_mock):
-    respx_mock.post("/api/auth/login").mock(return_value=_login_response())
-    respx_mock.post("/api/agent/tools/execute").mock(
-        return_value=_execute_response(
-            "get_document_status", success=False, failure_reason="PERMISSION_DENIED"
+        await asyncio.gather(
+            client.call_tool("search_knowledge", {"query": "a"}, token=TOKEN_A),
+            client.call_tool("search_knowledge", {"query": "b"}, token=TOKEN_B),
         )
+        await client.call_tool("search_knowledge", {"query": "c"}, token=TOKEN_A)
+    finally:
+        await client.aclose()
+    by_query = {
+        json.loads(c.request.content)["calls"][0]["arguments"]["query"]: c.request
+        for c in execute.calls
+    }
+    assert by_query["a"].headers["authorization"] == f"Bearer {TOKEN_A}"
+    assert by_query["b"].headers["authorization"] == f"Bearer {TOKEN_B}"
+    assert by_query["c"].headers["authorization"] == f"Bearer {TOKEN_A}"
+
+
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+@pytest.mark.parametrize("status", [401, 403])
+async def test_rejected_caller_token_raises_without_retry_or_login(settings, respx_mock, status):
+    login = respx_mock.post("/api/auth/login").mock(return_value=httpx.Response(200))
+    execute = respx_mock.post("/api/agent/tools/execute").mock(
+        return_value=httpx.Response(status, json={"message": "expired"})
     )
-    client = BackendClient(settings)
-    try:
-        result = await client.call_tool("get_document_status", {"documentId": "x"})
-    finally:
-        await client.aclose()
-    assert result.success is False
-    assert result.failure_reason == "PERMISSION_DENIED"
+    with pytest.raises(BackendAuthError) as exc:
+        await _call(BackendClient(settings))
+    assert exc.value.service_account is False
+    assert execute.call_count == 1 and login.call_count == 0
 
 
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_login_network_failure_raises_unavailable(settings, respx_mock):
-    respx_mock.post("/api/auth/login").mock(side_effect=httpx.ConnectError("refused"))
-    client = BackendClient(settings)
-    try:
-        with pytest.raises(BackendUnavailableError):
-            await client.call_tool("search_knowledge", {"query": "x"})
-    finally:
-        await client.aclose()
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_token_none_is_refused_when_degraded_mode_is_off(settings, respx_mock):
+    login = respx_mock.post("/api/auth/login")
+    execute = respx_mock.post("/api/agent/tools/execute")
+    with pytest.raises(BackendAuthError):
+        await _call(BackendClient(settings), token=None)
+    assert login.call_count == 0 and execute.call_count == 0
 
 
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_tool_call_network_failure_raises_unavailable(settings, respx_mock):
-    respx_mock.post("/api/auth/login").mock(return_value=_login_response())
-    respx_mock.post("/api/agent/tools/execute").mock(side_effect=httpx.ReadTimeout("slow"))
-    client = BackendClient(settings)
-    try:
-        with pytest.raises(BackendUnavailableError):
-            await client.call_tool("search_knowledge", {"query": "x"})
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_login_rejected_raises_auth_error(settings, respx_mock):
-    respx_mock.post("/api/auth/login").mock(
-        return_value=httpx.Response(401, json={"code": 401, "message": "bad credentials"})
-    )
-    client = BackendClient(settings)
-    try:
-        with pytest.raises(BackendAuthError):
-            await client.call_tool("search_knowledge", {"query": "x"})
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_login_missing_fields_raises_protocol_error(settings, respx_mock):
-    respx_mock.post("/api/auth/login").mock(
-        return_value=httpx.Response(200, json={"code": 0, "data": {}})
-    )
-    client = BackendClient(settings)
-    try:
-        with pytest.raises(BackendProtocolError):
-            await client.call_tool("search_knowledge", {"query": "x"})
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_execute_non_200_raises_protocol_error(settings, respx_mock):
-    respx_mock.post("/api/auth/login").mock(return_value=_login_response())
-    respx_mock.post("/api/agent/tools/execute").mock(return_value=httpx.Response(500, text="boom"))
-    client = BackendClient(settings)
-    try:
-        with pytest.raises(BackendProtocolError):
-            await client.call_tool("search_knowledge", {"query": "x"})
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_malformed_results_shape_raises_protocol_error(settings, respx_mock):
-    respx_mock.post("/api/auth/login").mock(return_value=_login_response())
-    respx_mock.post("/api/agent/tools/execute").mock(
-        return_value=httpx.Response(
-            200, json={"code": 0, "data": {"requestId": "x", "results": []}}
-        )
-    )
-    client = BackendClient(settings)
-    try:
-        with pytest.raises(BackendProtocolError):
-            await client.call_tool("search_knowledge", {"query": "x"})
-    finally:
-        await client.aclose()
-
-
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_a_stale_cached_token_triggers_relogin_once_on_401(settings, respx_mock):
-    login = respx_mock.post("/api/auth/login").mock(
-        side_effect=[_login_response(token="jwt-1"), _login_response(token="jwt-2")]
-    )
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_backend_cookies_are_never_replayed_across_callers(settings, respx_mock):
     execute = respx_mock.post("/api/agent/tools/execute").mock(
         side_effect=[
-            httpx.Response(401, json={"code": 401, "message": "expired"}),
-            _execute_response("search_knowledge", data={"found": False, "sources": []}),
+            httpx.Response(
+                200,
+                headers={"set-cookie": "JSESSIONID=victim; Path=/"},
+                json={"data": {"results": [{"name": "search_knowledge", "success": True}]}},
+            ),
+            execute_ok("search_knowledge"),
         ]
     )
     client = BackendClient(settings)
     try:
-        result = await client.call_tool("search_knowledge", {"query": "x"})
+        await client.call_tool("search_knowledge", {"query": "a"}, token=TOKEN_A)
+        await client.call_tool("search_knowledge", {"query": "b"}, token=TOKEN_B)
     finally:
         await client.aclose()
-    assert result.success is True
-    assert login.call_count == 2
-    assert execute.call_count == 2
-    assert execute.calls[1].request.headers["authorization"] == "Bearer jwt-2"
+    assert "cookie" not in execute.calls[1].request.headers
 
 
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_persistent_401_raises_auth_error_after_one_retry(settings, respx_mock):
-    respx_mock.post("/api/auth/login").mock(return_value=_login_response())
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_network_failure_raises_unavailable_without_chaining(settings, respx_mock):
+    respx_mock.post("/api/agent/tools/execute").mock(side_effect=httpx.ReadTimeout("slow"))
+    with pytest.raises(BackendUnavailableError) as exc:
+        await _call(BackendClient(settings))
+    assert exc.value.__cause__ is None and exc.value.__suppress_context__
+
+
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_non_200_error_omits_the_response_body(settings, respx_mock):
     respx_mock.post("/api/agent/tools/execute").mock(
-        return_value=httpx.Response(401, json={"code": 401, "message": "nope"})
+        return_value=httpx.Response(500, text="SECRET-DOC-BODY")
     )
-    client = BackendClient(settings)
-    try:
-        with pytest.raises(BackendAuthError):
-            await client.call_tool("search_knowledge", {"query": "x"})
-    finally:
-        await client.aclose()
+    with pytest.raises(BackendProtocolError) as exc:
+        await _call(BackendClient(settings))
+    assert "SECRET-DOC-BODY" not in str(exc.value) and "500" in str(exc.value)
 
 
-@pytest.mark.respx(base_url="http://backend.test")
-async def test_expired_cached_token_triggers_relogin_before_any_call(settings, respx_mock):
-    login = respx_mock.post("/api/auth/login").mock(
-        side_effect=[_login_response(token="jwt-1", expires_in=1), _login_response(token="jwt-2")]
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_malformed_results_shape_raises_protocol_error(settings, respx_mock):
+    respx_mock.post("/api/agent/tools/execute").mock(
+        return_value=httpx.Response(200, json={"data": {"results": []}})
     )
+    with pytest.raises(BackendProtocolError):
+        await _call(BackendClient(settings))
+
+
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_failed_result_is_parsed_without_raising(settings, respx_mock):
+    respx_mock.post("/api/agent/tools/execute").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "results": [
+                        {"name": "x", "success": False, "failureReason": "PERMISSION_DENIED"}
+                    ]
+                }
+            },
+        )
+    )
+    result = await _call(BackendClient(settings))
+    assert result.success is False and result.failure_reason == "PERMISSION_DENIED"
+
+
+# --- degraded mode: explicit shared service account -------------------------------------
+
+
+def _sa_settings() -> Settings:
+    return Settings(
+        backend_base_url="http://backend.test",
+        allow_shared_service_account=True,
+        service_username="svc-mcp",
+        service_password="not-a-real-password",
+    )
+
+
+def _login(token: str) -> httpx.Response:
+    return httpx.Response(200, json={"data": {"token": token, "expiresIn": 86400}})
+
+
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_service_account_logs_in_once_and_reuses_token(respx_mock):
+    login = respx_mock.post("/api/auth/login").mock(return_value=_login("sa-jwt"))
     execute = respx_mock.post("/api/agent/tools/execute").mock(
-        return_value=_execute_response("search_knowledge", data={"found": False, "sources": []})
+        return_value=execute_ok("search_knowledge")
     )
-    client = BackendClient(settings)
+    client = BackendClient(_sa_settings())
     try:
-        await client.call_tool("search_knowledge", {"query": "x"})
-        # token_refresh_margin_seconds=60 > expires_in=1, so this one is already "expired" locally.
-        await client.call_tool("search_knowledge", {"query": "y"})
+        await client.call_tool("search_knowledge", {"query": "x"}, token=None)
+        await client.call_tool("search_knowledge", {"query": "y"}, token=None)
     finally:
         await client.aclose()
-    assert login.call_count == 2
-    assert execute.calls[1].request.headers["authorization"] == "Bearer jwt-2"
+    assert login.call_count == 1
+    assert execute.calls[1].request.headers["authorization"] == "Bearer sa-jwt"
+
+
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_service_account_relogins_once_on_stale_token(respx_mock):
+    login = respx_mock.post("/api/auth/login").mock(side_effect=[_login("sa-1"), _login("sa-2")])
+    execute = respx_mock.post("/api/agent/tools/execute").mock(
+        side_effect=[httpx.Response(401), execute_ok("search_knowledge")]
+    )
+    result = await _call(BackendClient(_sa_settings()), token=None)
+    assert result.success and login.call_count == 2
+    assert execute.calls[1].request.headers["authorization"] == "Bearer sa-2"
+
+
+@pytest.mark.respx(base_url="http://backend.test", assert_all_called=False)
+async def test_service_account_login_rejected_is_flagged_as_service_account(respx_mock):
+    respx_mock.post("/api/auth/login").mock(return_value=httpx.Response(401, text="BODY"))
+    with pytest.raises(BackendAuthError) as exc:
+        await _call(BackendClient(_sa_settings()), token=None)
+    assert exc.value.service_account is True and "BODY" not in str(exc.value)

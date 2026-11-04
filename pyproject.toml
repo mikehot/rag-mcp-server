@@ -1,6 +1,6 @@
 [project]
 name = "rag-mcp-server"
-version = "0.1.0"
+version = "0.2.0"
 description = "Standalone MCP server exposing the rag-knowledge-base read-only tools to any MCP client"
 authors = [
     { name = "jacky", email = "mikehot668@gmail.com" }

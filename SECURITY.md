@@ -1,87 +1,80 @@
 # Security Note
 
-What this server can do, what it holds, and what is and is not hardened in this version. Verified
-against the code in this repo and the installed `mcp` SDK (2.3.0) on 2026-10-15, not asserted from
-memory — see "How this was checked" at the end.
+What this server can do, what it holds, and what is and is not hardened in this version (v0.2.0).
+Design rationale and trade-offs: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## What this server can do
 
 Three read-only tools, proxied unchanged from the Java backend's own tool boundary: `search_knowledge`,
-`list_documents`, `get_document_status`. No write, upload, delete, or admin operation is exposed, because
-none of those exist in the backend's `AgentToolService` that this server calls — there is nothing here to
-disable, the capability was never built.
+`list_documents`, `get_document_status`. No write, upload, delete, or admin operation is exposed.
 
-## The single service-account model (the central tradeoff)
+## Authentication model: the caller is the identity
 
-This server logs in once as **one configured service account** (`RAG_MCP_SERVICE_USERNAME` /
-`RAG_MCP_SERVICE_PASSWORD`) and uses that account's JWT for every tool call, regardless of who or what is
-on the other end of the MCP connection. It does **not** pass through or ask for the end user's own
-identity.
+The backend must always see the real caller. This server has no identity of its own by default.
 
-**Consequence**: everyone who can talk to this server (every MCP client it's wired into) sees exactly what
-that one service account's ACL grants allow — no more, no less. This is a deliberate v1 simplification, not
-an oversight; per-caller identity (OAuth / token passthrough to the Java backend) is real future work, not
-implemented here.
+- **stdio (default).** The user's own backend bearer token is supplied through `RAG_USER_TOKEN` in the
+  environment of the server process their MCP client launches. One process = one user.
+- **streamable-HTTP (optional, `RAG_MCP_TRANSPORT=streamable-http`).** The token is read from the
+  `Authorization: Bearer` header of **each request** and forwarded for that request only. Nothing is
+  cached per session or per connection (`stateless_http`). `RAG_USER_TOKEN` is ignored in this mode.
+- **Identity comes only from the token.** The tools have no tenant/user/group parameters; extra
+  arguments a caller sends (`tenant_id`, `user_id`, `group`, `token`, ...) are dropped and never
+  forwarded. The backend derives identity and ACL from the token.
+- **Fail closed.** A missing or malformed token (wrong characters, whitespace, `Bearer ` prefix,
+  over 8 KiB) is refused with a tool error and **no backend request is made**. A token the backend
+  rejects (HTTP 401/403) produces a tool error after one request; there is no retry, re-login or
+  fallback. The server never decodes the token; the backend decides validity and expiry.
 
-**What this means operationally**:
-- Create a dedicated account for this server, scoped to only the knowledge bases it should expose. Do not
-  point `RAG_MCP_SERVICE_USERNAME` at an admin account.
-- Anyone who can configure or run this server (e.g. edit their Claude Desktop config) gets that account's
-  full read access to those knowledge bases. Treat the credential with the same care as a shared read-only
-  API key, not as a per-user login.
-- If you need different callers to see different documents, this version cannot do that — don't deploy it
-  as a shared service until identity passthrough exists.
+### Degraded mode: shared service account (off by default)
+
+`RAG_MCP_ALLOW_SHARED_SERVICE_ACCOUNT=true` together with `RAG_MCP_SERVICE_USERNAME` /
+`RAG_MCP_SERVICE_PASSWORD` serves requests that carry **no token** as one shared service account.
+
+Security meaning: every such caller shares a single identity and ACL; the backend's audit log cannot
+tell them apart; anyone who can reach the server (or edit the client config) gets that account's full
+read access. Use only for local, single-user trials with a dedicated, minimally-scoped read-only
+account (never an admin). Safeguards: disabled by default; setting the credentials without the flag
+makes startup fail; it never replaces a token that was supplied but is malformed, expired or rejected;
+a warning is logged at startup and on every call served this way (no credentials in it).
+
+## Threat model
+
+| Threat | Mitigation | Residual risk |
+|---|---|---|
+| Caller A obtains B's data via shared state (HTTP) | Token is a per-call argument; no per-session state; cookies disabled on the shared HTTP client; tested with interleaved and concurrent callers | A bug in future code; the tests are the guard |
+| Caller picks another tenant/user/group via tool arguments | No such parameters; extra arguments dropped; identity from token only | `knowledge_base_id` is still caller-chosen, but the backend ACL-filters it for that token |
+| Silent privilege change when a token expires | No fallback on rejected/malformed tokens; degraded mode only when no token at all, and off by default | Operator enables degraded mode knowingly |
+| Token leaks via logs/errors | Fixed-text errors; `from None` for transport errors; no response bodies; httpx request log silenced; log-capture tests | Third-party log config the operator adds (e.g. DEBUG HTTP wire logging) |
+| Header injection through the token | Token charset allow-list; whitespace/CR/LF rejected | None known |
+| Token theft on the wire (HTTP mode) | None here: the server does no TLS | Run behind a TLS proxy; bind to loopback (default) |
+| Token theft at rest | Token lives in process memory / the client's config `env` block, never written by this server | The client config file holds it in plaintext; protect it like a password |
+| Unauthenticated abuse of HTTP mode | Without a token every call is refused and nothing reaches the backend | Not rate limited; reachable port can be probed; no MCP-level auth |
+| Stolen/long-lived token | Backend's expiry/revocation applies (401/403 surfaces as an error) | Short-lived tokens are the operator's responsibility |
+
+## Logging boundary
+
+Never logged or placed in errors: bearer tokens, service-account passwords, request headers,
+backend response bodies, document text, snippets, user names, query text. What is logged: tool
+name and event type (e.g. "credential missing", "backend rejected the caller's token"), startup
+and per-call degraded-mode warnings, and the MCP SDK's own messages (tool name and generic error
+text only). Exceptions raised in this package carry fixed text and an HTTP status code. This is
+enforced by tests that capture all log output at DEBUG across success and failure paths and assert
+none of the token, response body or user name appears.
+
+The operator can still defeat this by enabling third-party wire-level logging (e.g. httpx/httpcore
+DEBUG, a reverse proxy logging `Authorization`). Don't.
 
 ## What this server holds, and where
 
-- **The service-account password**: read once from the environment (`RAG_MCP_SERVICE_PASSWORD`) at login
-  time, sent only in the login request body over HTTPS/HTTP to the backend, never logged, never written to
-  disk. Put it in `.env` locally (gitignored, see `.env.example`) or your MCP client's own secret-config
-  mechanism — never in a committed file.
-- **The JWT it gets back**: held in memory only (`BackendClient._token`), forwarded as a `Bearer` header on
-  every tool call, re-fetched automatically before it expires. It is never written to disk and does not
-  survive a process restart.
-- **Nothing is persisted by this server.** It has no database and no log file of its own; every tool call
-  is stateless from this process's point of view (the Java backend's own `ask_log`/audit tables are a
-  separate concern — see rag-knowledge-base's `docs/delivery/DATA_HANDLING.md`, which this server does not
-  touch at all, since it never calls `/api/ask`).
+- **Caller tokens:** stdio holds one in the process environment for the process lifetime; HTTP holds
+  one per in-flight request only. Never written to disk, never logged.
+- **Service-account password and JWT (degraded mode only):** read from env, sent only in the login
+  body; the JWT is cached in memory and re-fetched before expiry.
+- **Nothing else is persisted.** No database, no log file of its own.
 
-## Logging
+## Out of scope
 
-Checked the installed `mcp` SDK's source directly (`mcp/server/mcpserver/server.py`,
-`tools/tool_manager.py`): on a rejected tool call it logs only the tool name and the **names** of the
-invalid argument fields, never their values; on a `ToolError` it logs the tool name and the error message
-— which, in this server, are the fixed, generic strings in `server.py`'s `_FAILURE_MESSAGES`, never the
-raw query text, document content, or credentials. This server's own code (`backend_client.py`) contains no
-logging calls of its own. So: no question text, document content, password, or token appears in this
-server's logs, by construction, not by configuration you have to remember to set.
-
-## Transport: stdio only, by design, for now
-
-The default and tested transport is `stdio` — this server runs as a local subprocess that your MCP client
-(Claude Desktop, Claude Code, etc.) launches and talks to directly; nothing listens on a network port, so
-there is no remote attacker surface in this mode.
-
-The underlying SDK also supports `sse` and `streamable-http` transports for remote access, and
-`create_server()`'s `MCPServer.run()` could be pointed at either — **this has not been set up, tested, or
-hardened here**. Running it that way would expose these tools over the network with no MCP-level auth of
-its own (the service account auth is between this server and the Java backend, not between a remote MCP
-client and this server). Don't expose this server remotely without adding that layer first; treat
-`stdio`-only as the supported mode of this version.
-
-## What is explicitly out of scope for v1
-
-- Per-user identity / OAuth passthrough (see above).
-- Rate limiting or its own call budget on top of the Java backend's own (the backend's `AgentToolService`
-  still caps a single `/api/agent/tools/execute` request at 3 calls, but this server issues one call per
-  MCP tool invocation, so that cap does not meaningfully bound a client that just calls the tool many
-  times in a row).
-- Remote transport hardening (previous section).
-- Credential rotation tooling — rotating the service account's password means updating the env var and
-  restarting this server; there's no hot-reload.
-
-## How this was checked
-
-File:line claims above were read from this repo's `src/rag_mcp_server/` and the installed `mcp==2.3.0`
-package on 2026-10-15, the same day this server was first written — not carried over from an older
-version or another project's docs. Re-check this file against the code if either changes materially.
+- Token refresh / OAuth flows (stdio users replace an expired token and restart the client).
+- MCP-level auth, TLS, rate limiting and abuse controls for the HTTP transport.
+- Per-user audit inside this server (the backend's audit sees the real caller).
+- Real-backend verification of 401-vs-403 semantics and JWT expiry (tested with mocks only).
