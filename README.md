@@ -57,7 +57,7 @@ account is needed.
 uv sync
 ```
 
-### 3. 接入 Claude Desktop (stdio)
+### 3. Connect Claude Desktop (stdio)
 
 `claude_desktop_config.json` -- every user puts **their own** token in **their own** config:
 
@@ -79,7 +79,10 @@ uv sync
 The config file stores the token in plaintext; protect it like a password and never commit it. Restart
 Claude Desktop after editing. When the token expires, replace it and restart again.
 
-#### Manual verification (to be done by you; not verified by the author of this change)
+#### Live verification checklist (against a running backend)
+
+Automated tests in `tests/test_identity.py` verify these six properties in-process with `respx` mocks.
+When connecting Claude Desktop to a live Java backend, verify end-to-end with:
 
 1. Restart Claude Desktop; the server should list `search_knowledge`, `list_documents`, `get_document_status`.
 2. Ask it to run `list_documents`. Expect only documents your own account can see.
