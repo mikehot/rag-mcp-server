@@ -127,6 +127,7 @@ caller. v0.2:
 ```bash
 uv sync                      # install
 uv run pytest                # unit + contract tests (mocked backend, no live server needed)
+uv run python scripts/verify_mcp_stdio.py  # verify real stdio MCP initialize + tools/list handshake
 uv run ruff check .          # lint
 uv run ruff format .         # format
 uv run rag-mcp-server        # run for real against RAG_MCP_BACKEND_BASE_URL (needs the Java backend up)
