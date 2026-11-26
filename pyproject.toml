@@ -18,6 +18,7 @@ rag-mcp-server = "rag_mcp_server:main"
 
 [dependency-groups]
 dev = [
+    "mypy>=1.15,<2",
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
     "respx>=0.21",
@@ -38,3 +39,7 @@ src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true

@@ -22,5 +22,7 @@ jobs:
         run: uv run ruff check .
       - name: Format check
         run: uv run ruff format --check .
+      - name: Type check
+        run: uv run mypy src
       - name: Tests
         run: uv run pytest
