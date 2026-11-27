@@ -19,10 +19,10 @@ rag-mcp-server = "rag_mcp_server:main"
 [dependency-groups]
 dev = [
     "mypy>=1.15,<2",
-    "pytest>=8.0",
+    "pytest>=9.2.0",
     "pytest-asyncio>=1.5.0",
     "respx>=0.21",
-    "ruff>=0.17,<0.18",
+    "ruff>=0.17.6,<0.18",
 ]
 
 [build-system]
